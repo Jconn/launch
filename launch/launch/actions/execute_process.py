@@ -22,6 +22,8 @@ import shlex
 import signal
 import threading
 import traceback
+import logging
+
 from typing import Any  # noqa: F401
 from typing import Callable
 from typing import cast
@@ -78,7 +80,6 @@ from ..utilities import perform_substitutions
 
 _global_process_counter_lock = threading.Lock()
 _global_process_counter = 0  # in Python3, this number is unbounded (no rollover)
-
 
 @expose_action('executable')
 class ExecuteProcess(Action):
@@ -199,6 +200,11 @@ class ExecuteProcess(Action):
             involved.
         :param: on_exit list of actions to execute upon process exit.
         """
+        try:
+            respawn = bool(kwargs['respawn'])
+            del kwargs['respawn']
+        except KeyError:
+            respawn = False
         super().__init__(**kwargs)
         self.__cmd = [normalize_to_list_of_substitutions(x) for x in cmd]
         self.__name = name if name is None else normalize_to_list_of_substitutions(name)
@@ -221,6 +227,12 @@ class ExecuteProcess(Action):
         self.__sigterm_timeout = normalize_to_list_of_substitutions(sigterm_timeout)
         self.__sigkill_timeout = normalize_to_list_of_substitutions(sigkill_timeout)
         self.__emulate_tty = emulate_tty
+
+        try:
+            self.__respawn = respawn
+        except KeyError:
+            self.__respawn = False
+
         self.__prefix = normalize_to_list_of_substitutions(
             LaunchConfiguration('launch-prefix', default='') if prefix is None else prefix
         )
@@ -343,6 +355,7 @@ class ExecuteProcess(Action):
         return []
 
     def _shutdown_process(self, context, *, send_sigint):
+        self.__respawn = False
         if self.__shutdown_received:
             # Do not handle shutdown more than once.
             return None
@@ -492,6 +505,9 @@ class ExecuteProcess(Action):
                 self.__stderr_logger.info(
                     self.__output_format.format(line=line, this=self)
                 )
+
+        self.__stdout_buffer = io.StringIO()
+        self.__stderr_buffer = io.StringIO()
 
     def __on_shutdown(self, event: Event, context: LaunchContext) -> Optional[SomeActionsType]:
         return self._shutdown_process(
@@ -681,7 +697,11 @@ class ExecuteProcess(Action):
                 pid, returncode, ' '.join(cmd)
             ))
         await context.emit_event(ProcessExited(returncode=returncode, **process_event_args))
-        self.__cleanup()
+        #return code of 0 is normal exit 
+        if self.__respawn and returncode != 0:
+            await self.__execute_process(context)
+        else:
+            self.__cleanup()
 
     def execute(self, context: LaunchContext) -> Optional[List[LaunchDescriptionEntity]]:
         """
